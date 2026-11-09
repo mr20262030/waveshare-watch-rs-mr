@@ -2,16 +2,12 @@
   <img src=".github/waveshare-watch-rs.png" alt="waveshare-watch-rs icon" width="278" height="271" />
 </p>
 
- # waveshare-watch-rs
-
-[![oosmetrics](https://api.oosmetrics.com/api/v1/badge/achievement/d90d81a8-b5be-4e00-8418-c1e0b9321f57.svg)](https://oosmetrics.com/repo/infinition/waveshare-watch-rs)
-
-##  Featured On
-* **Hackaday:** [Rust-y Firmware For Waveshare Smartwatch](https://hackaday.com/2026/04/11/rust-y-firmware-for-waveshare-smartwatch/)
-  
-<img width="400" height="270" alt="image" src="https://github.com/user-attachments/assets/331e6778-bf67-4f5f-a753-b65d6e0f1d57" />
+ # waveshare-watch-rs-mr
+ ***Una version con español, temas y caratulas nuevas para:
+ https://github.com/infinition/waveshare-watch-rs
 
 
+ 
 100% Rust `no_std` smartwatch firmware for the **Waveshare ESP32-S3-Touch-AMOLED-2.06**.
 
 Complete conversion of the original C/C++ project (ESP-IDF + Arduino GFX + LVGL) to a single-binary Rust codebase relying on `esp-hal` 1.0, `esp-rtos`, Embassy, and custom drivers for each of the board's peripherals.
