@@ -13,6 +13,7 @@ pub mod maze;
 pub mod settings;
 pub mod mp3player;
 pub mod smarthome;
+pub mod pedometer;
 
 /// Input state passed to apps each frame
 pub struct AppInput {
@@ -50,4 +51,6 @@ pub enum AppState {
     Mp3Player,
     SmartHome,
     Settings,
+    Pedometer,
+    XiaozhiBoot,
 }

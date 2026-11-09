@@ -41,6 +41,10 @@ impl WifiConfig {
     pub fn ssid_str(&self) -> &str {
         core::str::from_utf8(&self.ssid[..self.ssid_len]).unwrap_or("")
     }
+
+    pub fn pass_str(&self) -> &str {
+        core::str::from_utf8(&self.password[..self.pass_len]).unwrap_or("")
+    }
 }
 
 // WiFi connection state

@@ -8,11 +8,13 @@ mod drivers;
 mod peripherals;
 mod ui;
 mod apps;
+mod ota;
 
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
+use embedded_graphics::prelude::*;
 use embedded_graphics_core::prelude::RawData;
 use embedded_hal_bus::i2c::RefCellDevice;
 use esp_alloc as _;
@@ -57,6 +59,7 @@ use crate::ui::launcher::Launcher;
 use crate::apps::settings::SettingsApp;
 use crate::apps::mp3player::Mp3Player;
 use crate::apps::smarthome::SmartHomeApp;
+use crate::apps::pedometer::PedometerApp;
 use crate::peripherals::audio::{Es8311, fill_beep_buffer};
 
 // Network runner task (must be spawned for WiFi to work)
@@ -65,10 +68,11 @@ async fn net_task(mut runner: embassy_net::Runner<'static, esp_radio::wifi::Wifi
     runner.run().await
 }
 
-// Simple NTP sync (UDP to pool.ntp.org:123)
+// Simple NTP sync (UDP to pool.ntp.org:123) with configurable UTC offset
 async fn ntp_sync(
     stack: embassy_net::Stack<'static>,
     rtc: &mut crate::peripherals::rtc::Pcf85063aRtc<impl embedded_hal::i2c::I2c>,
+    utc_offset_hours: i8,
 ) -> Result<(), ()> {
     use embassy_net::udp::{UdpSocket, PacketMetadata};
 
@@ -99,20 +103,26 @@ async fn ntp_sync(
             let ntp_secs = u32::from_be_bytes([response[40], response[41], response[42], response[43]]);
             // Convert NTP epoch (1900) to Unix epoch (1970): subtract 70 years in seconds
             let unix_secs = ntp_secs.wrapping_sub(2_208_988_800);
-            // Convert to hours/minutes/seconds (UTC+2 for France)
-            let utc_offset = 2 * 3600; // CEST (summer time)
-            let local_secs = unix_secs + utc_offset;
-            let time_of_day = local_secs % 86400;
+            // Apply timezone offset in seconds (e.g. UTC-6 = -6 * 3600)
+            let utc_offset = (utc_offset_hours as i64) * 3600;
+            let local_timestamp = (unix_secs as i64) + utc_offset;
+
+            let mut total_days = (local_timestamp / 86400) as i32;
+            let mut time_of_day = (local_timestamp % 86400) as i32;
+            if time_of_day < 0 {
+                time_of_day += 86400;
+                total_days -= 1;
+            }
+
             let hours = (time_of_day / 3600) as u8;
             let minutes = ((time_of_day % 3600) / 60) as u8;
             let seconds = (time_of_day % 60) as u8;
 
-            // Calculate date (simplified: days since epoch)
-            let total_days = (local_secs / 86400) as i32;
             // Simple date from days since 1970-01-01
             let (year, month, day) = days_to_date(total_days);
 
-            println!("[NTP] Time: {:02}:{:02}:{:02} {:02}/{:02}/{}", hours, minutes, seconds, day, month, year);
+            println!("[NTP] Time: {:02}:{:02}:{:02} {:02}/{:02}/{} (UTC {:+})",
+                hours, minutes, seconds, day, month, year, utc_offset_hours);
 
             // Set RTC
             let dt = crate::peripherals::rtc::DateTime::new(
@@ -197,12 +207,10 @@ fn update_power_stats(
 async fn main(_spawner: Spawner) {
     // Heap: 200KB SRAM + PSRAM for large allocs
     // The BLE+WiFi coex radio stack needs ~100KB+ of internal SRAM for
-    // btdm_controller_init tasks and buffers. 64KB was too small and
-    // caused a StoreProhibited panic (null-pointer from failed alloc).
+    // btdm_controller_init tasks and buffers.
     esp_alloc::heap_allocator!(size: 200 * 1024);
+
     // Power-aware: default to 160MHz instead of 240MHz.
-    // Saves ~30% CPU power without noticeable impact on UI/sensor work.
-    // Game code can still trigger short bursts via DMA/peripherals at 80MHz QSPI which is unchanged.
     let peripherals = esp_hal::init(
         esp_hal::Config::default()
             .with_cpu_clock(esp_hal::clock::CpuClock::_160MHz)
@@ -217,6 +225,7 @@ async fn main(_spawner: Spawner) {
 
     esp_println::logger::init_logger_from_env();
     println!("=== Waveshare Watch RS v0.4 (Embassy) ===");
+    ota::ensure_default_rust_boot();
 
     let delay = Delay::new();
 
@@ -506,8 +515,10 @@ async fn main(_spawner: Spawner) {
     let mut maze_game = MazeGame::new();
     let mut launcher = Launcher::new();
     let mut settings_app = SettingsApp::new();
+    settings_app.set_initial_creds(wifi_ssid, wifi_pass);
     let mut mp3_player = Mp3Player::new();
     let mut smarthome_app = SmartHomeApp::new();
+    let mut pedometer_app = PedometerApp::new();
     if !mp3_files.is_empty() {
         mp3_player.set_track_count(mp3_files.len());
         mp3_player.set_track_name(&mp3_files[0]);
@@ -622,8 +633,8 @@ async fn main(_spawner: Spawner) {
             match app_state {
                 AppState::Watchface => match current_page {
                     // Clock page: 1 Hz when gyro is off (only seconds change),
-                    // 33 ms when gyro is on (smooth ball animation).
-                    Page::Clock => if watchface.gyro_enabled {
+                    // 33 ms when gyro is on or in SportTactical (smooth ball animation).
+                    Page::Clock => if watchface.gyro_enabled || watchface.style == crate::ui::theme::WatchfaceStyle::SportTactical {
                         Duration::from_millis(33)
                     } else {
                         Duration::from_secs(1)
@@ -635,11 +646,9 @@ async fn main(_spawner: Spawner) {
                     Page::Power   => Duration::from_secs(1),
                 },
                 AppState::Launcher | AppState::Settings | AppState::Mp3Player
-                | AppState::SmartHome => Duration::from_millis(100),
-                // Flappy previously ran at 8 ms (~125 Hz). The panel can't
-                // even display that (VSync is ~33 ms) so the extra ticks
-                // just burned CPU and DMA for no visible benefit.
-                AppState::Flappy => Duration::from_millis(33),
+                | AppState::SmartHome | AppState::XiaozhiBoot => Duration::from_millis(100),
+                // Flappy and Pedometer run at 33 ms (~30 Hz)
+                AppState::Flappy | AppState::Pedometer => Duration::from_millis(33),
                 AppState::Snake | AppState::Game2048 | AppState::Tetris
                 | AppState::Maze => Duration::from_millis(33),
             }
@@ -667,6 +676,8 @@ async fn main(_spawner: Spawner) {
         // (CTRL7 = 0). The QMI8658's gyro alone draws ~1.5 mA so this is a meaningful win.
         let need_imu = screen_state >= 2
             && (watchface.gyro_enabled
+                || (app_state == AppState::Watchface && watchface.style == crate::ui::theme::WatchfaceStyle::SportTactical)
+                || app_state == AppState::Pedometer
                 || app_state == AppState::Maze
                 || app_state == AppState::Tetris
                 || app_state == AppState::Flappy
@@ -682,6 +693,9 @@ async fn main(_spawner: Spawner) {
             if let Ok(a) = imu.read_accel() {
                 accel = (a.x, a.y, a.z);
                 watchface.update_accel(a.x, a.y, a.z);
+                let pedo_input = AppInput { touch: None, swipe: None, tap: false, accel, dt_ms: dt_ms.max(1) };
+                pedometer_app.update(&pedo_input);
+                watchface.steps = pedometer_app.steps();
             }
             if let Ok(g) = imu.read_gyro() {
                 gyro_data = ((g.x * 10.0) as i16, (g.y * 10.0) as i16, (g.z * 10.0) as i16);
@@ -939,9 +953,15 @@ async fn main(_spawner: Spawner) {
                                 Timer::after(Duration::from_millis(100)).await;
                             }
                             if stack.config_v4().is_some() {
-                                if ntp_sync(stack, &mut rtc).await.is_ok() {
+                                if ntp_sync(stack, &mut rtc, settings_app.timezone_offset).await.is_ok() {
                                     ntp_synced = true;
-                                    println!("[NTP] synced");
+                                    println!("[NTP] synced with timezone offset {}", settings_app.timezone_offset);
+                                    if let Ok(dt) = rtc.get_time() {
+                                        watchface.update_time(dt.hours, dt.minutes, dt.seconds);
+                                        watchface.update_date(dt.day, dt.month, dt.year);
+                                        watchface.force_redraw();
+                                        page_dirty = true;
+                                    }
                                 }
                             }
                         }
@@ -1102,32 +1122,19 @@ async fn main(_spawner: Spawner) {
                             page_dirty = true;
                         }
                     } else if tap_event {
-                        // BLE toggle
-                        if WatchFace::is_ble_zone(last_touch_x, last_touch_y) {
-                            ble_toggle_request = true;
+                        // Watchface Style Switcher [ ESTILO / STYLE ]
+                        if WatchFace::is_style_zone(last_touch_x, last_touch_y) {
+                            watchface.next_style();
                             watchface.force_redraw();
                             page_dirty = true;
-                        // WiFi toggle
+                        // Apps launcher [ APPS ]
+                        } else if WatchFace::is_apps_zone(last_touch_x, last_touch_y) {
+                            app_state = AppState::Launcher;
+                        // WiFi toggle (top-left status pill)
                         } else if WatchFace::is_wifi_zone(last_touch_x, last_touch_y) {
                             wifi_toggle_request = true;
                             watchface.force_redraw();
                             page_dirty = true;
-                        // CPU frequency cycle (live DVFS)
-                        } else if WatchFace::is_cpu_zone(last_touch_x, last_touch_y) {
-                            watchface.cycle_cpu();
-                            let actual = crate::peripherals::cpu_clock::set_cpu_mhz(watchface.cpu_mhz);
-                            watchface.cpu_mhz = actual;
-                            power_stats.cpu_mhz = actual;
-                            println!("CPU freq: {}MHz (live)", actual);
-                            watchface.force_redraw();
-                            page_dirty = true;
-                        // Apps launcher
-                        } else if WatchFace::is_apps_zone(last_touch_x, last_touch_y) {
-                            app_state = AppState::Launcher;
-                        // Gyro toggle
-                        } else if WatchFace::is_gyro_zone(last_touch_y) {
-                            let enabled = watchface.toggle_gyro();
-                            println!("Gyro: {}", if enabled { "ON" } else { "OFF" });
                         }
                     }
                 }
@@ -1197,13 +1204,82 @@ async fn main(_spawner: Spawner) {
             }
 
             AppState::Launcher => {
-                // Track touch Y for tap detection
+                launcher.language = watchface.language;
+                // Track touch point for tap detection
                 if let Ok((point, _)) = touch.poll() {
-                    if let Some(tp) = point { last_touch_y = tp.y; }
+                    if let Some(tp) = point {
+                        last_touch_x = tp.x;
+                        last_touch_y = tp.y;
+                    }
                 }
-                if let Some(new_state) = launcher.update(swipe_event, tap_event, last_touch_y) {
+                if let Some(new_state) = launcher.update(swipe_event, tap_event, last_touch_x, last_touch_y) {
                     app_state = new_state;
                     match app_state {
+                        AppState::XiaozhiBoot => {
+                            let _ = embedded_graphics::primitives::Rectangle::new(
+                                embedded_graphics::geometry::Point::zero(),
+                                embedded_graphics::geometry::Size::new(410, 502),
+                            )
+                            .into_styled(embedded_graphics::primitives::PrimitiveStyle::with_fill(crate::ui::theme::COLOR_BG))
+                            .draw(&mut fb);
+
+                            let _ = crate::ui::theme::draw_xiaozhi_icon(&mut fb, 205, 170);
+
+                            let style_title = embedded_graphics::mono_font::MonoTextStyle::new(
+                                &embedded_graphics::mono_font::ascii::FONT_10X20,
+                                crate::ui::theme::COLOR_TEXT_PRIMARY,
+                            );
+                            let style_sub = embedded_graphics::mono_font::MonoTextStyle::new(
+                                &embedded_graphics::mono_font::ascii::FONT_9X15,
+                                crate::ui::theme::COLOR_TEXT_SECONDARY,
+                            );
+                            let style_hint = embedded_graphics::mono_font::MonoTextStyle::new(
+                                &embedded_graphics::mono_font::ascii::FONT_7X13,
+                                crate::ui::theme::COLOR_TEXT_MUTED,
+                            );
+
+                            let (t1, t2, t3) = match watchface.language {
+                                crate::ui::theme::Language::Spanish => (
+                                    "Iniciando Xiaozhi...",
+                                    "Asistente IA por voz",
+                                    "Presiona RESET para volver a Rust",
+                                ),
+                                crate::ui::theme::Language::English => (
+                                    "Starting Xiaozhi...",
+                                    "AI Voice Assistant",
+                                    "Press RESET button to return to Rust",
+                                ),
+                            };
+
+                            let _ = embedded_graphics::text::Text::with_alignment(
+                                t1,
+                                embedded_graphics::geometry::Point::new(205, 240),
+                                style_title,
+                                embedded_graphics::text::Alignment::Center,
+                            )
+                            .draw(&mut fb);
+
+                            let _ = embedded_graphics::text::Text::with_alignment(
+                                t2,
+                                embedded_graphics::geometry::Point::new(205, 275),
+                                style_sub,
+                                embedded_graphics::text::Alignment::Center,
+                            )
+                            .draw(&mut fb);
+
+                            let _ = embedded_graphics::text::Text::with_alignment(
+                                t3,
+                                embedded_graphics::geometry::Point::new(205, 430),
+                                style_hint,
+                                embedded_graphics::text::Alignment::Center,
+                            )
+                            .draw(&mut fb);
+
+                            fb.flush(&mut display);
+                            Timer::after(Duration::from_millis(600)).await;
+                            ota::switch_to_xiaozhi_and_reboot();
+                        }
+                        AppState::Pedometer => pedometer_app.setup(),
                         AppState::Snake => snake_game.setup(),
                         AppState::Game2048 => { game_2048.setup(); game_2048.render(&mut fb); fb.flush(&mut display); }
                         AppState::Tetris => tetris_game.setup(),
@@ -1212,8 +1288,8 @@ async fn main(_spawner: Spawner) {
                         AppState::Mp3Player => mp3_player.setup(),
                         AppState::SmartHome => smarthome_app.setup(),
                         AppState::Settings => {}
+                        AppState::Launcher => {}
                         AppState::Watchface => { watchface.force_redraw(); page_dirty = true; }
-                        _ => {}
                     }
                 } else {
                     launcher.render(&mut fb);
@@ -1276,20 +1352,24 @@ async fn main(_spawner: Spawner) {
                     fb.flush_vsync(&mut display, &te_pin);
                     next_watchface_flush = now + Duration::from_millis(33);
                 }
-                if boot_button.is_low() { app_state = AppState::Launcher; Timer::after(Duration::from_millis(200)).await; }
+                if swipe_event == Some(SwipeDirection::Right) || boot_button.is_low() {
+                    app_state = AppState::Launcher;
+                    Timer::after(Duration::from_millis(200)).await;
+                }
             }
 
             AppState::SmartHome => {
                 let input = AppInput { touch: None, swipe: swipe_event, tap: tap_event, accel, dt_ms: dt_ms.max(1) };
                 smarthome_app.update(&input);
-                // TODO: when get_pending_request() returns a URL, send HTTP request via embassy-net
-                // For now just show the UI
                 smarthome_app.render(&mut fb);
                 if now >= next_watchface_flush {
                     fb.flush_vsync(&mut display, &te_pin);
                     next_watchface_flush = now + Duration::from_millis(100);
                 }
-                if boot_button.is_low() { app_state = AppState::Launcher; Timer::after(Duration::from_millis(200)).await; }
+                if swipe_event == Some(SwipeDirection::Right) || boot_button.is_low() {
+                    app_state = AppState::Launcher;
+                    Timer::after(Duration::from_millis(200)).await;
+                }
             }
 
             AppState::Mp3Player => {
@@ -1300,20 +1380,126 @@ async fn main(_spawner: Spawner) {
                     fb.flush_vsync(&mut display, &te_pin);
                     next_watchface_flush = now + Duration::from_millis(200);
                 }
-                if boot_button.is_low() { app_state = AppState::Launcher; Timer::after(Duration::from_millis(200)).await; }
+                if swipe_event == Some(SwipeDirection::Right) || boot_button.is_low() {
+                    app_state = AppState::Launcher;
+                    Timer::after(Duration::from_millis(200)).await;
+                }
+            }
+
+            AppState::Pedometer => {
+                pedometer_app.language = watchface.language;
+                let touch_pt = if touch_int.is_low() || tap_event {
+                    Some(crate::peripherals::touch::TouchPoint { x: last_touch_x, y: last_touch_y, fingers: 1 })
+                } else {
+                    None
+                };
+                let input = AppInput {
+                    touch: touch_pt,
+                    swipe: swipe_event,
+                    tap: tap_event,
+                    accel,
+                    dt_ms: dt_ms.max(1),
+                };
+                if let AppResult::Exit = pedometer_app.update(&input) {
+                    app_state = AppState::Launcher;
+                }
+                watchface.steps = pedometer_app.steps();
+                pedometer_app.render(&mut fb);
+                if now >= next_watchface_flush {
+                    fb.flush_vsync(&mut display, &te_pin);
+                    next_watchface_flush = now + Duration::from_millis(33);
+                }
+                if swipe_event == Some(SwipeDirection::Right) || boot_button.is_low() {
+                    app_state = AppState::Launcher;
+                    Timer::after(Duration::from_millis(200)).await;
+                }
             }
 
             AppState::Settings => {
                 settings_app.update(dt_ms.max(1));
-                // For T9: detect touch down via GPIO38 for rapid multi-tap
                 if tap_event {
                     settings_app.handle_tap(last_touch_x, last_touch_y);
                 }
-                // Also read live touch position for keyboard area
                 if let Ok((Some(tp), _)) = touch.poll() {
                     last_touch_x = tp.x;
                     last_touch_y = tp.y;
                 }
+
+                // Handle Settings App requests
+                // 0. Language sync
+                if settings_app.language != watchface.language {
+                    watchface.language = settings_app.language;
+                    launcher.language = settings_app.language;
+                    watchface.force_redraw();
+                    page_dirty = true;
+                }
+
+                // 1. Exit (< APPS or swipe right when keyboard is closed)
+                if settings_app.exit_requested || (!settings_app.keyboard.is_active() && swipe_event == Some(SwipeDirection::Right)) {
+                    app_state = AppState::Launcher;
+                    settings_app.exit_requested = false;
+                }
+
+                // 2. Hour adjustment requested (+/- 1h)
+                if settings_app.hour_adjust_pending != 0 {
+                    if let Ok(mut dt) = rtc.get_time() {
+                        let new_h = (dt.hours as i16 + settings_app.hour_adjust_pending as i16).rem_euclid(24) as u8;
+                        dt.hours = new_h;
+                        let _ = rtc.set_time(&dt);
+                        watchface.update_time(dt.hours, dt.minutes, dt.seconds);
+                        watchface.force_redraw();
+                        page_dirty = true;
+                    }
+                    settings_app.hour_adjust_pending = 0;
+                }
+
+                // 3. NTP sync requested
+                if settings_app.sync_ntp_requested {
+                    settings_app.sync_ntp_requested = false;
+                    if !wifi_connected {
+                        wifi_on_request = true;
+                    } else if stack.config_v4().is_some() {
+                        if ntp_sync(stack, &mut rtc, settings_app.timezone_offset).await.is_ok() {
+                            if let Ok(dt) = rtc.get_time() {
+                                watchface.update_time(dt.hours, dt.minutes, dt.seconds);
+                                watchface.update_date(dt.day, dt.month, dt.year);
+                                watchface.force_redraw();
+                                page_dirty = true;
+                            }
+                        }
+                    }
+                }
+
+                // 4. WiFi connect requested from Settings
+                if settings_app.wifi_connect_requested {
+                    settings_app.wifi_connect_requested = false;
+                    let ssid_str = settings_app.wifi_config.ssid_str();
+                    let pass_str = settings_app.wifi_config.pass_str();
+                    if !ssid_str.is_empty() {
+                        use esp_radio::wifi::{ModeConfig, ClientConfig, AuthMethod};
+                        let client_config = ClientConfig::default()
+                            .with_ssid(alloc::string::String::from(ssid_str))
+                            .with_password(alloc::string::String::from(pass_str))
+                            .with_auth_method(if pass_str.is_empty() { AuthMethod::None } else { AuthMethod::WpaWpa2Personal });
+                        let _ = wifi_controller.set_config(&ModeConfig::Client(client_config));
+                        wifi_on_request = true;
+                    }
+                }
+
+                // Sync live WiFi status back to settings_app
+                settings_app.wifi_state = if wifi_connected {
+                    crate::peripherals::wifi::WifiState::Connected
+                } else if wifi_on_request {
+                    crate::peripherals::wifi::WifiState::Connecting
+                } else {
+                    crate::peripherals::wifi::WifiState::Disconnected
+                };
+
+                // 5. Reboot requested
+                if settings_app.reboot_requested {
+                    esp_hal::system::software_reset();
+                }
+
                 settings_app.render(&mut fb);
                 if now >= next_watchface_flush {
                     fb.flush_vsync(&mut display, &te_pin);
@@ -1325,9 +1511,7 @@ async fn main(_spawner: Spawner) {
                 }
             }
 
-            _ => {
-                app_state = AppState::Watchface;
-            }
+            AppState::XiaozhiBoot => {}
         }
     }
 }
